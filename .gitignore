@@ -37,3 +37,6 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# Extra Stuff
+Analysis/all_data_final_30.06.21.txt

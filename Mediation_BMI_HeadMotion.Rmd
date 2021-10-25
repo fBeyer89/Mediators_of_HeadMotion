@@ -1,0 +1,597 @@
+---
+title: "Mediation_BMI_HeadMotion"
+author: "F. Beyer"
+date: "6/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lavaan)
+library(haven)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(naniar)
+library(dplyr)
+library(performance)
+library(car)
+library(semPlot)
+#library(webshot2) #(only in R version 4.0.2 for making flowchart)
+library(htmlwidgets) #(only in R version 4.0.2 for making flowchart)
+source("/data/gh_gr_agingandobesity_share/literature/methods/statistics/linear_models_course_rogermundry_2018/functions/diagnostic_fcns.r")
+source('create_mediation_model.R')
+source('create_regression_model.R')
+```
+
+## Loading data
+
+### MRI SICs and demographics
+First, we load the different SICs (mrt_pseudonym/pv_pseudonym/SIC).
+
+```{r load correct SICs }
+
+conv_ID_study_ID=readxl::read_xlsx("/data/gh_gr_agingandobesity_share/life_shared/Data/Raw/Questionnaires_raw/2021_PV599_Frauke_HeadMotion/pv599/PV599_PV-MRT-Pseudonymliste.xlsx")
+
+conv_SIC_ID=readxl::read_xlsx("/data/gh_gr_agingandobesity_share/life_shared/Data/Preprocessed/derivatives/pseudo_mrt_20201214.xlsx")
+colnames(conv_SIC_ID)=c("SIC","mrt_pseudonym")
+
+#Merge starting from MRI list as MRI is needed for each analysis
+ids_merged=merge(conv_SIC_ID, conv_ID_study_ID,  by="mrt_pseudonym", all.x=T)
+ids=ids_merged
+#drop all NAs
+#ids = ids_merged %>% drop_na()
+```
+There are `r nrow(ids)` participants with MRI and PV-identifier.
+
+```{r load "Stammdaten"}
+demographics=readxl::read_xlsx("/data/gh_gr_agingandobesity_share/life_shared/Data/Raw/Questionnaires_raw/2021_PV599_Frauke_HeadMotion/pv599/PV0599_R00001.xlsx")
+colnames(demographics)[1]="pv_pseudonym"
+demographics$BirthDate <- as.Date(parse_date_time(demographics$TEILNEHMER_GEB_JJJJMM, "ym"))
+```
+
+```{r load MRI data}
+MRI_followup=readxl::read_xlsx("/data/gh_gr_agingandobesity_share/life_shared/Data/Raw/Questionnaires_raw/2021_PV599_Frauke_HeadMotion/pv599/PV0599_T01158.xlsx")
+colnames(MRI_followup)[1]="pv_pseudonym"
+
+```
+
+```{r merge demographics & MRI data from LIFE}
+
+id_demo=merge(ids, demographics[,c("pv_pseudonym","TEILNEHMER_GESCHLECHT", "BirthDate")], all.x=T, by="pv_pseudonym")
+id_demo_mrid=merge(id_demo, MRI_followup[,c("pv_pseudonym","MRT_ZW_U_DATUM","MRT_ZW_U_S_CMRR_RESTING")],  all.x=T, by="pv_pseudonym")
+id_demo_mrid$Age <- round(as.numeric(as.period(interval(start = id_demo_mrid$BirthDate, end = id_demo_mrid$MRT_ZW_U_DATUM), unit = "years"), "years"), 1)
+```
+There are `r nrow(id_demo_mrid[duplicated(id_demo_mrid$pv_pseudonym),])` duplicates for pv_pseudonym.
+```{r remove duplicates}
+#We have to remove duplicates of subjects
+id_demo_mrid = id_demo_mrid[!duplicated(id_demo_mrid$SIC),]
+
+```
+
+```{r load file describing all Scans acquired until now (30.06.21)}
+mris_6_21=read.table("/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Analysis/all_data_final_30.06.21.txt")
+colnames(mris_6_21)[1]="SIC"
+mris_6_21$mri_done=1
+
+final=merge(mris_6_21,id_demo_mrid, all.x=T, by="SIC")
+```
+
+In total, 1006 participants have done MRI. Out of these `r nrow(final[is.na(final$MRT_ZW_U_DATUM),])` did not have a pv_pseudonym. Maybe because they did not have a scan at baseline (2P48S2WGUW) or for other unknown reasons (D2E0755953, 2C7113BE1D, 1B437EE3BF, 394F0E812F). Yet, they are in the SIC-mrt_pseudonym list which was sent to Laurenz.
+
+### Anthropometric data
+```{r anthropometric data}
+anthro=readxl::read_xlsx("/data/gh_gr_agingandobesity_share/life_shared/Data/Raw/Questionnaires_raw/2021_PV599_Frauke_HeadMotion/pv599/PV0599_T01169_NODUP.xlsx")
+colnames(anthro)[1]="pv_pseudonym"
+anthro=anthro[,c("pv_pseudonym", "ANTHRO_GROESSE", "ANTHRO_GEWICHT", "ANTHRO_GROESSE_SELBST", "ANTHRO_GEWICHT_SELBST")]
+#replace 996,999 with NAs
+anthro <- replace_with_na_at(anthro, .vars = c(2:4), condition = ~.x %in% c(996, 999))
+anthro$BMI=anthro$ANTHRO_GEWICHT/(anthro$ANTHRO_GROESSE/100)**2
+anthro$BMI_self=anthro$ANTHRO_GEWICHT_SELBST/(anthro$ANTHRO_GROESSE_SELBST/100)**2
+anthro$has_anthro_data=1
+```
+Removal of implausible values happens later.
+
+### Physio data
+We load average RR, RVT and HR, as well as RR-HM/RR-DVARS, RVT-HM/RVT-DVARS correlations.
+```{r load RR, mean RVT and HR}
+filelist = list.files(path="/data/pt_life_restingstate_followup/Data/physio/", 
+                      pattern="*_RVT_RR_HR.txt",
+                      full.names =  TRUE)
+
+#assuming tab separated values with a header    
+datalist = lapply(filelist, function(x)read.table(x)) 
+
+#assuming the same header/columns for all files
+physio1 = do.call("rbind", datalist)
+
+physio1$filelist=filelist
+
+physio1 <- physio1 %>%
+        separate(filelist, c("filename","interest"), sep = "//") %>% 
+        select(-filename) %>%   
+        separate(interest, c("SIC","rest"), sep = "_RVT") %>% select(-rest)
+colnames(physio1)[1:3]=c("RVT","RR","HR")
+```
+
+```{r load frame-by-frame measures RR-FD, RR-DVARS, RVT-FD, RVT-DVARS}
+
+physio2=read.table("/data/pt_life_restingstate_followup/Results/Physio/results_rs_motion_physio.csv",header=T,fill = T,sep = ',')
+SIC=read.table("/data/pt_life_restingstate_followup/Results/Physio/SIC.csv",header=T,fill = T,sep = ',')
+
+#Replace all zeros with NAs
+physio2$SIC=SIC$Var1
+physio2 <- replace_with_na_at(physio2, .vars = c(1:13), condition = ~.x %in% 0)
+
+#Log-transform mean FD
+physio2$mFD=log(physio2$meanFD)
+
+n_FD_NA=length(physio2[is.na(physio2$meanFD),"SIC"])
+n_DVARS_NA=length(physio2[is.na(physio2$meanstdDVARS),"SIC"])
+n_PHYSIO_NA=length(physio2[is.na(physio2$meanstdDVARS),"SIC"])
+```
+
+There are `r n_FD_NA` subjects without FD estimation because preprocessing did not work/missing DICOMs (LI00801352, LI01530759, LI02625493, LI04230513). There is one additional subject for which DVARS estimation failed (total: `r n_DVARS_NA`)(LI0057625X). There are thus five for whom physio-resting state correlations were not estimated.
+
+```{r missing and failed physio processing}
+#Physio Data not acquired completely
+missing=read.table("/data/pt_life_restingstate_followup/Data/physio/missing.txt")
+#Physio Data did not run through preprocessing correctly
+failed=read.table("/data/pt_life_restingstate_followup/Data/physio/failed.txt")
+```
+
+There are `r nrow(missing)` missing and `r nrow(failed)` failed subjects for Physio Preprocessing.
+
+## BIS data
+We load the raw BIS data and curate.
+```{r load psychology}
+bis=readxl::read_xlsx("/data/gh_gr_agingandobesity_share/life_shared/Data/Raw/Questionnaires_raw/2021_PV599_Frauke_HeadMotion/pv599/PV0599_T00201_NODUP.xlsx")
+bis=bis[,c(1,10:39)]
+
+#reverse items
+bis[,1+c(1,7,8,9,10,12,13,15,20,29,30)]=4-bis[,1+c(1,7,8,9,10,12,13,15,20,29,30)]
+
+#Create total score
+#if less than 4 items are missing, replace with mean score
+#Count missing elements,replace by average over all other columns if < 4 missing
+bis$na_count <- apply(is.na(bis[, c(2:31)]), 1, sum)
+bis$BIS_total <- rowSums(bis[,c(2:31)]) 
+bis$BIS_total <- ifelse((is.na(bis$BIS_total) & bis$na_count < 4), rowSums(bis[,c(2:31)], na.rm = T)*30/(30-bis$na_count), bis$BIS_total)
+table(is.na(bis$BIS_total))
+
+#Motor(2, 3, 4, 17, 19, 22, 25 16, 21, 23, 30*)
+#if less than 2 items are missing, replace with mean score
+bis$na_count_motor <- apply(is.na(bis[, c(2,3,4,17,19,22,25,16,21,23,30)]), 1, sum)
+bis$BIS_motor <- rowSums(bis[,c(2,3,4,17,19,22,25,16,21,23,30)]) 
+bis$BIS_motor <- ifelse((is.na(bis$BIS_motor) & bis$na_count_motor < 2), rowSums(bis[,c(2,3,4,17,19,22,25,16,21,23,30)], na.rm = T)*11/10, bis$BIS_motor)
+
+table(is.na(bis$BIS_motor))
+
+#Self-control (1, 7, 8, 12, 13, 14)
+bis$BIS_selfcr <- rowSums(bis[,1+c(1, 7, 8, 12, 13, 14)]) 
+table(is.na(bis$BIS_selfcr))
+```
+`r nrow(bis[bis$na_count==5,c("na_count","BIS_total", "BIS11_SIC")])`person has five missings `r bis[bis$na_count==5,c("BIS11_SIC")]` and keeps NA in total score.
+`r nrow(bis[bis$na_count_motor>1,c("na_count_motor","BIS_motor", "BIS11_SIC")])` people have 2 missings `r bis[bis$na_count_motor>1,"BIS11_SIC"][1,1]`, `r bis[bis$na_count_motor>1,"BIS11_SIC"][2,1]`, `r bis[bis$na_count_motor>1,"BIS11_SIC"][3,1]` and keep NA in motor score.
+` table(is.na(bis$BIS_selfcr))[2]` people have missings on the self-control scale. 
+
+```{r final bis dataset}
+bis=bis[,c("BIS11_SIC","BIS_total","BIS_motor","BIS_selfcr")]
+bis$has_bis_data=1
+colnames(bis)[1]="pv_pseudonym"
+```
+
+# Merge into one big dataset
+```{r merge all datasets}
+tmp=merge(final, physio1, by="SIC", all.x=T)
+tmp=merge(tmp, physio2, by="SIC", all.x=T)
+tmp=merge(tmp, bis, by="pv_pseudonym", all.x=T)
+tmp=merge(tmp, anthro, by="pv_pseudonym", all.x=T)
+#View(tmp)
+colnames(tmp)
+hm=tmp[,c(1,2,3,4,5,9,10,11,12,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,35,36,37)]
+colnames(hm)=c("pv_pseudonym" , "SIC", "mri_done", "mrt_pseudonym", "Sex", "Age","RVT","RR", "HR", "mstdDVARS","corrFDstdDVARS","corrFDresp","corrFDoxy","corrFDRVT","corrFDHR", "corrDVARSresp","corrDVARSoxy","corrDVARSRVT","corrDVARSHR","mFD","BIS_total","BIS_motor","BIS_selfc", "has_bis_data", "BMI", "BMI_self", "anthro_data")
+hm$Sex=as.factor(hm$Sex)
+levels(hm$Sex)=c("male","female")
+```
+
+## Data checking
+
+### Check missings
+```{r missings}
+summary(hm[, c("Age","BMI","RVT","RR", "HR", "mstdDVARS","corrFDstdDVARS","corrFDresp","corrFDoxy","corrFDRVT","corrFDHR", "corrDVARSresp","corrDVARSoxy","corrDVARSRVT","corrDVARSHR","mFD","BIS_total","BIS_motor","BIS_selfc")])
+```
+
+```{r summarize missings, eval=FALSE}
+Age: missing are the five who do not have a pv_pseudonym (LI03061233, LI00556918, LI0026893X, LI0071119X (unknown reasons), LI03335259 (no baseline scan). 
+BMI: missing are the five without pv_pseudonym + 5 who could not be matched `r tmp[is.na(tmp$has_anthro_data), c("mrt_pseudonym", "pv_pseudonym")]` as well as two who has implausible values `r tmp[!is.na(tmp$has_anthro_data) & is.na(tmp$BMI), c("mrt_pseudonym", "pv_pseudonym")]`.
+RVT, RR, HR: 30 missing values are those who has failed or missing Physio data.
+DVARS,corrFDstdDVARS: five missings (LI00801352, LI01530759, LI02625493, LI04230513 scan not completed, DVARS estimation failed LI0057625X.
+corrFDresp,corrFDoxy, corrFDRVT, corrFDHR: 34 missings (30 Physio + 4 MRI)
+corrDVARSrespo, corrDVARSoxy, corrDVARSRVT, corrDVARSHR (30 Physio + 5 MRI/DVARS)
+mFD: 4 missings
+BIS_total: 12 missings (5 no pv_pseudonym, 1 missing BIS-total, 6 no BIS data) `r hm[is.na(hm$BIS_total),c("pv_pseudonym", "has_bis_data")]`
+BIS_motor: 13 missings (5 no pv_pseudonym, 2 missing BIS-motor, 6 no BIS data) `r hm[is.na(hm$BIS_motor),c("pv_pseudonym", "has_bis_data")]`
+BIS_selfc: 28 missings (5 no pv_pseudonym, 17 missing BIS-motor, 6 no BIS data) `r hm[is.na(hm$BIS_motor),c("pv_pseudonym", "has_bis_data")]`
+
+This all seems plausible. Could ask Frau Dietz about the 5 without pv_pseudonym.
+```
+
+
+### Histograms
+Plot histograms of all variable distributions
+
+```{r histograms}
+ggplot(gather(hm[, c("Age","BMI","RVT","RR", "HR", "mstdDVARS","corrFDstdDVARS","corrFDresp","corrFDoxy","corrFDRVT","corrFDHR", "corrDVARSresp","corrDVARSoxy","corrDVARSRVT","corrDVARSHR","mFD","BIS_total","BIS_motor","BIS_selfc")]), aes(value)) + 
+  geom_histogram(bins = 15, na.rm=TRUE) + 
+  facet_wrap(~key, scales = 'free') 
+```
+Distributions of Age, BIS_total, BIS_motor, BMI, corrDVARSHR, corrDVARSoxy, corrDVARSresp, corrDVARSRVT, corrFDHR, corrFDoxy, corrFDresp, corrFDRVT, HR, mFD, mstdDVARS, RR, RVT look fine.
+```{r check main distributions}
+hist(hm$BIS_total)
+hist(hm$BMI)
+hist(hm$mFD)
+```
+corrFDstrDVARS is skewed to left, and BIS-selfcontr is not normally distributed (see below)
+
+```{r check critical distributions}
+hist(hm$corrFDstdDVARS)
+hist(hm$BIS_selfc)
+```
+
+### Remove implausible and missing values
+```{r prepare dataset for physiological analysis by removing missing/incomplete data}
+nrow(hm)
+hm_phys=subset(hm, !is.na(hm$BMI)) #12 excluded due to missings
+hm_phys=subset(hm_phys, !(hm_phys$BMI<15 | hm_phys$BMI>60)) #one with BMI > 60 excluded
+
+hm_phys=subset(hm_phys, !is.na(hm_phys$mFD)) #4 excluded due to missing FD
+physio_failed=nrow(subset(hm_phys, is.na(hm_phys$RR)))
+hm_phys=subset(hm_phys, !is.na(hm_phys$RR)) #27 excluded due to missing Physio
+hm_phys=subset(hm_phys, !is.na(hm_phys$HR)) #no additional exclusions due to missing HR
+RR_exl=nrow(subset(hm_phys, (hm_phys$RR<0.16 | hm_phys$RR>0.5)))
+hm_phys=subset(hm_phys, !(hm_phys$RR<0.16 | hm_phys$RR>0.5)) #4 excluded due to aberrant RR
+HR_excl=nrow(subset(hm_phys, (hm_phys$HR<40 | hm_phys$HR>110)))
+hm_phys=subset(hm_phys, !(hm_phys$HR<40 | hm_phys$HR>110)) # 45 excluded due to aberrant HR
+nrow(hm_phys)
+```
+
+```{r prepare dataset for psychological analysis by replacing missing/removing incomplete data}
+nrow(hm)
+hm_psy=subset(hm, !is.na(hm$BMI)) #12 excluded due to missings
+hm_psy=subset(hm_psy, !(hm_psy$BMI<15 | hm_psy$BMI>60)) #one with BMI > 60 excluded
+hm_psy=subset(hm_psy, !is.na(hm_psy$mFD))
+nrow(hm_psy)
+table(is.na(hm_psy$BIS_motor))
+table(is.na(hm_psy$BIS_total))
+table(is.na(hm_psy$BIS_selfc))
+```
+
+```{r create dataframe for flowchart}
+data <- list(n_orig=nrow(hm), n_BMI_miss=nrow(hm[is.na(hm$BMI),]), n_BMI_exlude=nrow(hm[!is.na(hm$BMI)&(hm$BMI<15|hm$BMI>60),]), 
+             fmri_failed=nrow(hm[is.na(hm$mFD),]), dvars_failed=nrow(hm[!is.na(hm$mFD)&is.na(hm$mstdDVARS),]),
+             physio_failed=physio_failed, RR_exl=RR_exl, 
+             HR_excl=HR_excl, 
+             BIS_tot_m=table(is.na(hm_psy$BIS_total))[2], BIS_mot_m=table(is.na(hm_psy$BIS_motor))[2], BIS_sc_m=table(is.na(hm_psy$BIS_selfc))[2],
+             final_phys_med=nrow(hm_phys), final_phys_reg_dvars=nrow(hm_phys[!is.na(hm_phys$corrFDstdDVARS),]), 
+             BIS_tot_t=table(is.na(hm_psy$BIS_total))[1], BIS_mot_t=table(is.na(hm_psy$BIS_motor))[1], BIS_sc_t=table(is.na(hm_psy$BIS_selfc))[1])
+```
+
+```{r produce a flowchart}
+graf<-DiagrammeR::grViz("
+
+digraph flowchart {
+
+# graph, node and edge definitions with substituted label text
+graph [compound = true, nodesep = 0.5, ranksep = 0.5, fontsize = 24,
+         color = crimson]
+
+node [fontname = Helvetica, fontcolor = black, fontsize=24,
+      shape = rectangle,  filled=true, color = white]
+
+subgraph cluster0{
+    label = 'General data exclusion';
+    fontname=Helvetica;
+    style=dashed;
+		color=darkslategray;
+		width=2
+		fontsize=30;
+	  node [color=black, width = 1.5]
+    basic[label = '@@1']
+    basic0[label = '@@2']
+    basic1[label = '@@3']
+    basic2[label = '@@4']
+    basic3[label = '@@5', style=dashed]
+    
+    basic-> basic0->basic1->basic2->basic3
+    }
+
+  subgraph cluster1 {
+    fontname=Helvetica;
+    fontsize=30;
+    style=dashed;
+		color=darkslategray;
+		width=2
+    node[color=black, width = 1.5]
+    physio00[label= 'Exclusion based on physiological data']
+    physio0[label = '@@6']
+    physio1[label = '@@7']
+    physio2[label = '@@8']
+    
+    physio00->physio0[style = invis]
+    physio0->physio1->physio2
+    
+  }
+
+  subgraph cluster2 {
+    style=dashed;
+		color=darkslategray;
+		width=2;
+		fontsize=24;
+		edge[style=invis]
+    node [color=black, width = 1.5]
+    physio3[label = '@@9']
+    physio4[label = '@@10']
+    physio5[label = '@@11']
+    
+    physio3->physio4->physio5
+    
+  }
+  
+    subgraph cluster3 {
+    
+    fontname=Helvetica;
+    style=dashed;
+    fontsize=30;
+		color=darkslategray;
+		width=2
+    node [color=black, width = 1.5]
+    edge[style=invis]
+    psy00[label = 'Exclusion based on psychological data']
+    psy0[label = '@@12']
+    psy1[label = '@@13']
+    psy2[label = '@@14']
+    
+    psy00->psy0
+    psy0->psy1->psy2
+    
+  }
+
+basic3->physio00
+basic2->psy00
+basic3->physio5
+physio2->physio3
+
+}
+
+[1]: paste0(data$n_orig, ' participants before 30th of June 2021')
+[2]: paste0(data$n_BMI_miss, ' without BMI data')
+[3]: paste0(data$n_BMI_exlude, ' with BMI > 60 kg/m2')
+[4]: paste0(data$fmri_failed, ' without fMRI data')
+[5]: paste0(data$dvars_failed, ' without DVARS processing')
+[6]: paste0(data$physio_failed, ' without physiological data or processing')
+[7]: paste0(data$RR_exl, ' outliers in RR')
+[8]: paste0(data$HR_excl, ' outliers in HR')
+[9]: paste0('Final sample for physiological mediation: N=', data$final_phys_med)
+[10]: paste0('Final sample for FD-respiration analysis: N=', data$final_phys_med)
+[11]: paste0('Final sample for DVARS-respiration analysis: N=', data$final_phys_reg_dvars)
+[12]: paste0(data$BIS_tot_m, ' missing BIS_total -> final mediation sample: N=', data$BIS_tot_t )
+[13]: paste0(data$BIS_mot_m, ' missing BIS_motor -> final mediation sample: N=', data$BIS_mot_t )
+[14]: paste0(data$BIS_sc_m, ' missing BIS_selfcontrol -> final mediation sample: N=', data$BIS_sc_t )
+
+")
+
+
+
+saveWidget(graf, "/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Analysis/flowchart.html")
+webshot(url="/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Analysis/flowchart.html", "/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Analysis/graf_revised2.png",delay = .5, zoom=5)
+```
+            
+## Mediation Hypotheses (Physiological data)
+First, we perform the mediation analyses regarding RR, RVT and HR.
+```{r Model for Hypothesis 1.1, echo=FALSE}
+mediator='RR'
+fit_RR=calc_mediation(mediator,hm_phys)
+
+semTab=semTable::semTable(fit_RR, type="csv", file='/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/model_results_RR')
+
+semPaths(fit_RR,rotation=2, what="path",whatLabels = "std",sizeMan=10,sizeMan2=10, 
+         curveAdjacent = TRUE, pastel=T, 
+         edge.color=c('green3','black',  'black',  'green3','red', 'green3', 'black' ,  'black',  'black', 'black',   
+                    'black','black', 'black', 'black', 'black', 'black'),
+         edge.width =2,
+         edge.label.cex=1.2, edge.label.position=0.4,
+         filetype="eps", filename="/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/RR_mediation", width=8, height=6)
+
+
+#Full model
+full=lm(mFD ~ RR + BMI + Age + Sex, data=hm_phys)
+summary(full)
+```
+
+```{r Model for Hypothesis 1.2, echo=FALSE}
+mediator='RVT'
+fit_RVT=calc_mediation(mediator,hm_phys)
+
+semTable::semTable(fit_RVT, type="csv", file='/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/model_results_RVT')
+
+semPaths(fit_RVT,rotation=2, what="path",whatLabels = "std",sizeMan=10,sizeMan2=10, 
+         curveAdjacent = TRUE, pastel=T, edge.label.cex=1.2, edge.label.position=0.4,
+         edge.color=c('black',  'red', 'green3', 'green3','red', 'green3', 'black' ,  'black',  'black', 'black',   
+         'black','black', 'black', 'black', 'black', 'black'),
+         edge.width =2,
+         filetype="eps", filename="/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/RVT_mediation", width=8, height=6)
+
+full=lm(mFD ~ RVT + BMI + Age + Sex, data=hm_phys)
+summary(full)
+```
+
+```{r Model for Hypothesis 1.3, echo=FALSE}
+mediator='HR'
+fit_HR=calc_mediation(mediator,hm_phys)
+
+semTable::semTable(fit_HR, type="csv", file='/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/model_results_HR')
+
+semPaths(fit_HR,rotation=2, what="path",whatLabels = "std",sizeMan=10,sizeMan2=10, 
+         curveAdjacent = TRUE, pastel=T, 
+         edge.color=c('green3',  'black','green3', 'green3','black', 'green3',   'black', 'black' , 'black', 'black',   
+         'black','black', 'black', 'black', 'black', 'black'),
+         edge.width =2,
+         edge.label.cex=1.2, edge.label.position=0.4,
+         filetype="eps", filename="/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/HR_mediation", width=8, height=6)
+```
+
+```{r arranging all plots together}
+library(png)
+library("ggplot2")
+library(grid)
+library("gridExtra")
+img1=readPNG("/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/RR_mediation.png")
+img2=readPNG("/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/RVT_mediation.png")
+img3=readPNG("/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/HR_mediation.png")
+image1 <- rasterGrob(img1, interpolate=TRUE)
+image2 <- rasterGrob(img2, interpolate=TRUE)
+image3 <- rasterGrob(img3, interpolate=TRUE)
+grid.arrange(image1, image1,image3, ncol = 2)
+```
+
+
+## Regression Hypotheses (Physiological data)
+Then, we performed the correlation of BMI and the correlation of FD/DVARS and respiratory trace/RVT.
+```{r Model for Hypothesis 2.1, echo=FALSE}
+outcome='corrFDresp'
+regress_model=calc_regression(outcome,hm_phys)
+summary(regress_model)
+```
+
+```{r Model for Hypothesis 2.2, echo=FALSE}
+outcome='corrDVARSresp'
+regress_model=calc_regression(outcome,hm_phys)
+summary(regress_model)
+```
+```{r Model for Hypothesis 2.3, echo=FALSE}
+outcome='corrFDRVT'
+regress_model=calc_regression(outcome,hm_phys)
+summary(regress_model)
+```
+
+```{r Model for Hypothesis 2.4, echo=FALSE}
+outcome='corrDVARSRVT'
+regress_model=calc_regression(outcome,hm_phys)
+summary(regress_model)
+```
+
+## Mediation Hypotheses (Psychological data)
+Finally, we perform the mediation models for the psychological measures.
+```{r Model for Hypothesis 3.1, echo=FALSE}
+mediator='BIS_total'
+fit_bis_total=calc_mediation(mediator,hm_psy)
+
+semTable::semTable(fit_bis_total, type="csv", file='/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/model_results_BIS_total')
+
+semPaths(fit_bis_total,rotation=2, what="path",whatLabels = "std",sizeMan=10,sizeMan2=10, 
+         curveAdjacent = TRUE, pastel=T, 
+         nodeLabels=(c("BIS \n total","mFD", "BMI", "Age", "Sex" )),
+         edge.color=c('green3',  'red','black', 'green3','black', 'green3',   'black', 'black' , 'black', 'black',   
+         'black','black', 'black', 'black', 'black', 'black'),
+         edge.width =2,
+         edge.label.cex=1.2, edge.label.position=0.4,
+         filetype="eps", filename="/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/BIS_total_mediation", width=8, height=6)
+```
+
+```{r Model for Hypothesis 3.2, echo=FALSE}
+mediator='BIS_motor'
+fit=calc_mediation(mediator,hm_psy)
+
+semTable::semTable(fit, type="csv", file='/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/model_results_BIS_motor')
+
+semPaths(fit,rotation=2, what="path",whatLabels = "std",sizeMan=10,sizeMan2=10, 
+         curveAdjacent = TRUE, pastel=T,  
+         nodeLabels=(c("BIS \n motor","mFD", "BMI", "Age", "Sex" )),
+         edge.color=c('green3',  'red','green3', 'green3','black', 'green3',   'black', 'black' , 'black', 'black',   
+         'black','black', 'black', 'black', 'black', 'black'),
+         edge.width =2, edge.label.cex=1.2, edge.label.position=0.4,
+         filetype="eps", filename="/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/BIS_motor_mediation",  width=8, height=6)
+```
+
+```{r Model for Hypothesis 3.3, echo=FALSE}
+mediator='BIS_selfc'
+fit_bis_selfc=calc_mediation(mediator,hm_psy)
+
+semTable::semTable(fit_bis_selfc, type="csv", file='/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/model_results_BIS_selfc')
+
+semPaths(fit_bis_selfc,rotation=2, what="path",whatLabels = "std",sizeMan=10,sizeMan2=10, 
+         nodeLabels=(c("BIS \n selfc","mFD", "BMI", "Age", "Sex" )),
+         curveAdjacent = TRUE, pastel=T,          
+         edge.color=c('green3',  'red','black', 'green3','black', 'green3',   'black', 'black' , 'black', 'black',   
+         'black','black', 'black', 'black', 'black', 'black'),
+         edge.width =2, edge.label.cex=1.2, edge.label.position=0.4,
+         filetype="eps", filename="/data/gh_gr_agingandobesity_share/life_shared/Results/External_coops/PV240_Dagher_Scholz_headmotion_gwas/Amendment2021/Results/model_results/BIS_selfc_mediation", width=8, height=6)
+```
+
+
+## Understanding the results
+```{r prepare dataset for physiological analysis by removing missing/incomplete data 2}
+nrow(hm)
+hm_phys=subset(hm, !is.na(hm$BMI)) #12 excluded due to missings
+hm_phys=subset(hm_phys, !(hm_phys$BMI<15 | hm_phys$BMI>60)) #one with BMI > 60 excluded
+
+hm_phys=subset(hm_phys, !is.na(hm_phys$mFD))
+hm_phys=subset(hm_phys, !is.na(hm_phys$RR)) #27 excluded due to missing Physio
+hm_phys=subset(hm_phys, !is.na(hm_phys$HR))
+hm_phys=subset(hm_phys, !(hm_phys$RR<0.16 | hm_phys$RR>0.5)) #4 excluded due to aberrant RR
+hm_phys=subset(hm_phys, !(hm_phys$HR<40 | hm_phys$HR>110)) # 46 excluded due to aberrant HR
+nrow(hm_phys)
+```
+
+```{r plot correlation of RR and mFD}
+ggplot(data=hm_phys, aes(x=RR, y=mFD)) +
+  geom_point()
+
+ggplot(data=hm_phys, aes(x=RR, y=RVT)) +
+  geom_point()
+
+#extreme edge with high RR and low FD
+hm_phys %>% filter(RR>0.38) %>% filter(mFD<(-2)) %>%arrange(RR)
+
+#other edge with low RR and high FD 
+
+hm_phys %>% filter(RR<0.19) %>% filter(mFD>(-0.6)) %>% arrange(RR)
+```
+
+
+
+
+
+## Compare different calculations of mean FD
+Compare head motion calculated in Matlab script (self-coded) to mean FD derived from rs-QA
+```{r compare Matlab mFD and rsQA mFD}
+filenames <- Sys.glob("/data/pt_life/LIFE_fu/wd_preprocessing/qc/_subject_*/calc_fd/fd.txt")
+
+fn=data.frame(filenames)
+#assuming tab separated values with a header    
+datalist = lapply(filenames, function(x)read.table(x)) 
+
+fd = do.call("rbind", datalist)
+
+
+fn$SIC <- fn %>%
+        separate(filenames, c("rest","interest"), sep = "_subject_") %>% 
+        select(-rest) %>%   
+        separate(interest, c("SIC","rest"), sep = "/") %>% select(-rest)
+fn_new=fn[rep(seq_len(nrow(fn)), each = 296),]
+
+fd$SIC=fn_new$SIC$SIC
+
+fd_per_subject= fd  %>%
+  group_by(SIC) %>%
+  summarize(mFD_rsqa = mean(V1))
+df_fd=as.data.frame(fd_per_subject)
+```
+
+
+```{r compare Matlab mFD (from Physio toolbox) and rsQA mFD}
+fd_comp=merge(df_fd, physio2, by.x="SIC", by.y="SIC", all.x=T)
+fd_comp=fd_comp[c("SIC","mFD_rsqa","meanFD")]
+plot(fd_comp$meanFD,fd_comp$mFD_rsqa)
+```
